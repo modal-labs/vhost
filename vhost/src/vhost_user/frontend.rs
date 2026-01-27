@@ -116,6 +116,28 @@ pub trait VhostUserFrontend: VhostBackend {
     /// sent by [`VhostUserFrontend::postcopy_advise`].
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> Result<()>;
+
+    /// Transfer device state to/from the backend via SET_DEVICE_STATE_FD message.
+    ///
+    /// This sends the SET_DEVICE_STATE_FD request with a file descriptor that the backend
+    /// uses to transfer its internal state during migration/snapshot operations.
+    ///
+    /// # Arguments
+    /// * `fd` - File descriptor for state transfer (read for LOAD, write for SAVE)
+    /// * `direction` - Direction of transfer (SAVE or LOAD)
+    /// * `phase` - Migration phase (currently only STOPPED is supported)
+    fn transfer_device_state(
+        &mut self,
+        fd: RawFd,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+    ) -> Result<()>;
+
+    /// Check if device state transfer completed successfully via CHECK_DEVICE_STATE message.
+    ///
+    /// This should be called after `transfer_device_state` to verify that the backend
+    /// successfully processed the state transfer without errors.
+    fn check_device_state(&mut self) -> Result<()>;
 }
 
 fn error_code<T>(err: VhostUserError) -> Result<T> {
@@ -670,6 +692,55 @@ impl VhostUserFrontend for Frontend {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
         let hdr = node.send_request_header(FrontendReq::POSTCOPY_END, None)?;
+        node.wait_for_ack(&hdr).map_err(|e| e.into())
+    }
+
+    fn transfer_device_state(
+        &mut self,
+        fd: RawFd,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+    ) -> Result<()> {
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::DEVICE_STATE)?;
+
+        let msg = VhostUserTransferDeviceState::new(direction, phase);
+        let hdr =
+            node.send_request_with_body(FrontendReq::SET_DEVICE_STATE_FD, &msg, Some(&[fd]))?;
+
+        // SET_DEVICE_STATE_FD response format (per vhost-user spec):
+        // - Bits 0-7: error code (0 = success)
+        // - Bit 8: invalid FD flag (1 = no FD returned by backend)
+        // So 0x100 means "success, no FD returned" - we must only check bits 0-7
+        if node.acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits() == 0
+            || !hdr.is_need_reply()
+        {
+            return Ok(());
+        }
+        node.check_state()?;
+
+        let (reply, body, rfds) = node.main_sock.recv_body::<VhostUserU64>()?;
+        if !reply.is_reply_for(&hdr) || !body.is_valid() {
+            return Err(Error::VhostUserProtocol(VhostUserError::InvalidMessage));
+        }
+        // Drop any returned file descriptor (we don't use backend-provided channels)
+        drop(rfds);
+
+        // Check only bits 0-7 for error code
+        let error_code = body.value & 0xFF;
+        if error_code != 0 {
+            return Err(Error::VhostUserProtocol(
+                VhostUserError::BackendInternalError,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_device_state(&mut self) -> Result<()> {
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::DEVICE_STATE)?;
+
+        let hdr = node.send_request_header(FrontendReq::CHECK_DEVICE_STATE, None)?;
         node.wait_for_ack(&hdr).map_err(|e| e.into())
     }
 }
