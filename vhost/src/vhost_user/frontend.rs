@@ -125,7 +125,7 @@ pub trait VhostUserFrontend: VhostBackend {
     /// # Arguments
     /// * `fd` - File descriptor for state transfer (read for LOAD, write for SAVE)
     /// * `direction` - Direction of transfer (SAVE or LOAD)
-    /// * `phase` - Migration phase (currently only STOPPED is supported)
+    /// * `phase` - Migration phase - (currently only STOPPED is supported by vhost, i.e. state transfer can only happen when the device is stopped)
     fn transfer_device_state(
         &mut self,
         fd: RawFd,
