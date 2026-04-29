@@ -28,6 +28,14 @@ pub use self::backend::{VhostUserBackend, VhostUserBackendMut};
 mod event_loop;
 pub use self::event_loop::VringEpollHandler;
 
+#[cfg(feature = "io-uring")]
+mod iouring;
+#[cfg(feature = "io-uring")]
+pub use self::iouring::{
+    IoUringCompletion, IoUringConfig, VhostUserBackendContext, VhostUserBackendEvent,
+    VringIoUringError, VringIoUringHandler, VringIoUringResult, VHOST_USER_BACKEND_USER_DATA_MASK,
+};
+
 mod handler;
 pub use self::handler::VhostUserHandlerError;
 
@@ -52,6 +60,24 @@ compile_error!("Both `postcopy` and `xen` features can not be enabled at the sam
 
 /// An alias for `GuestMemoryAtomic<GuestMemoryMmap<B>>` to simplify code.
 type GM<B> = GuestMemoryAtomic<GuestMemoryMmap<B>>;
+
+/// Event loop implementation used by vring worker threads.
+#[derive(Clone, Debug, Default)]
+pub enum EventLoopBackend {
+    /// Use epoll to wait for queue kicks and backend registered file descriptors.
+    #[default]
+    Epoll,
+    /// Use io_uring to wait for queue kicks and backend registered file descriptors.
+    #[cfg(feature = "io-uring")]
+    IoUring(IoUringConfig),
+}
+
+/// Options for [`VhostUserDaemon`] construction.
+#[derive(Clone, Debug, Default)]
+pub struct VhostUserDaemonOptions {
+    /// Worker event loop backend.
+    pub event_loop: EventLoopBackend,
+}
 
 #[derive(Debug)]
 /// Errors related to vhost-user daemon.
@@ -143,6 +169,26 @@ where
     ) -> Result<Self> {
         let handler = Arc::new(Mutex::new(
             VhostUserHandler::new(backend, atomic_mem).map_err(Error::NewVhostUserHandler)?,
+        ));
+
+        Ok(VhostUserDaemon {
+            name,
+            handler,
+            main_thread: None,
+            conn_state: None,
+        })
+    }
+
+    /// Create the daemon instance with explicit daemon options.
+    pub fn new_with_options(
+        name: String,
+        backend: T,
+        atomic_mem: GuestMemoryAtomic<GuestMemoryMmap<T::Bitmap>>,
+        options: VhostUserDaemonOptions,
+    ) -> Result<Self> {
+        let handler = Arc::new(Mutex::new(
+            VhostUserHandler::new_with_options(backend, atomic_mem, options)
+                .map_err(Error::NewVhostUserHandler)?,
         ));
 
         Ok(VhostUserDaemon {
@@ -317,6 +363,16 @@ where
         // Do not expect poisoned lock.
         self.handler.lock().unwrap().get_epoll_handlers()
     }
+
+    /// Retrieve the vring io_uring handlers.
+    ///
+    /// This is necessary to perform further actions like registering and unregistering some extra
+    /// event file descriptors when the daemon was created with [`EventLoopBackend::IoUring`].
+    #[cfg(feature = "io-uring")]
+    pub fn get_iouring_handlers(&self) -> Vec<Arc<VringIoUringHandler<T>>> {
+        // Do not expect poisoned lock.
+        self.handler.lock().unwrap().get_iouring_handlers()
+    }
 }
 
 impl<T: VhostUserBackend> Drop for VhostUserDaemon<T> {
@@ -368,6 +424,31 @@ mod tests {
             daemon.wait().unwrap_err();
             daemon.wait().unwrap();
         });
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[test]
+    fn test_new_daemon_iouring() {
+        if io_uring::IoUring::new(2).is_err() {
+            return;
+        }
+
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
+        );
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let daemon = VhostUserDaemon::new_with_options(
+            "test".to_owned(),
+            backend,
+            mem,
+            VhostUserDaemonOptions {
+                event_loop: EventLoopBackend::IoUring(IoUringConfig::default()),
+            },
+        )
+        .unwrap();
+
+        assert!(daemon.get_epoll_handlers().is_empty());
+        assert_eq!(daemon.get_iouring_handlers().len(), 2);
     }
 
     #[test]

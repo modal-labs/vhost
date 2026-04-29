@@ -9,6 +9,7 @@ which includes following external public APIs:
   messages.
 - A vring access trait (`VringT`) to access virtio queues, and three implementations of the trait:
   `VringState`, `VringMutex` and `VringRwLock`.
+- An optional `io-uring` feature that lets vring workers use io_uring instead of epoll.
 
 ## Usage
 The `vhost-user-backend` crate provides a framework to implement vhost-user backend services. The main interface provided by `vhost-user-backend` library is the `struct VhostUserDaemon`:
@@ -20,6 +21,12 @@ where
     B: Bitmap + 'static,
 {
     pub fn new(name: String, backend: S, atomic_mem: GuestMemoryAtomic<GuestMemoryMmap<B>>) -> Result<Self>;
+    pub fn new_with_options(
+        name: String,
+        backend: S,
+        atomic_mem: GuestMemoryAtomic<GuestMemoryMmap<B>>,
+        options: VhostUserDaemonOptions,
+    ) -> Result<Self>;
     pub fn start(&mut self, listener: Listener) -> Result<()>;
     pub fn wait(&mut self) -> Result<()>;
     pub fn get_epoll_handlers(&self) -> Vec<Arc<VringEpollHandler<S, V, B>>>;
@@ -47,6 +54,25 @@ The main thread and virtio queue working threads will concurrently access the un
 queues, so all virtio queue in multi-threading model. But the main thread only accesses virtio
 queues for configuration, so client could adopt locking policies to optimize for the virtio queue
 working threads.
+
+### io_uring worker mode
+
+By default vring workers use epoll. Enabling the `io-uring` Cargo feature adds
+`EventLoopBackend::IoUring`, `IoUringConfig`, `VringIoUringHandler`, and
+`VhostUserBackendContext`.
+
+```rust
+let options = VhostUserDaemonOptions {
+    event_loop: EventLoopBackend::IoUring(IoUringConfig::default()),
+};
+let daemon = VhostUserDaemon::new_with_options(name, backend, mem, options)?;
+```
+
+In this mode each worker thread owns one io_uring. The same ring polls queue kick eventfds and
+backend-registered file descriptors, and backend implementations can submit additional SQEs from
+`handle_event_with_context()`. Completions for those SQEs are delivered back through
+`VhostUserBackendEvent::IoUringCompletion`. To drive all queues and backend I/O from one user-space
+thread, return a single mask from `queues_per_thread()`.
 
 ## Example
 Example code to handle virtio messages from a virtio queue:

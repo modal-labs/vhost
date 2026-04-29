@@ -37,6 +37,9 @@ use vhost::vhost_user::GpuBackend;
 use super::vring::VringT;
 use super::GM;
 
+#[cfg(feature = "io-uring")]
+use crate::iouring::{VhostUserBackendContext, VhostUserBackendEvent};
+
 /// Trait with interior mutability for vhost user backend servers to implement concrete services.
 ///
 /// To support multi-threading and asynchronous IO, we enforce `Send + Sync` bound.
@@ -149,6 +152,27 @@ pub trait VhostUserBackend: Send + Sync {
         vrings: &[Self::Vring],
         thread_id: usize,
     ) -> Result<()>;
+
+    /// Handle worker-thread events with access to the shared io_uring.
+    ///
+    /// The default implementation preserves the existing eventfd based behavior for file
+    /// descriptor events and ignores backend io_uring completions.
+    #[cfg(feature = "io-uring")]
+    fn handle_event_with_context(
+        &self,
+        event: VhostUserBackendEvent,
+        vrings: &[Self::Vring],
+        thread_id: usize,
+        _context: &mut VhostUserBackendContext<'_>,
+    ) -> Result<()> {
+        match event {
+            VhostUserBackendEvent::Fd {
+                device_event,
+                evset,
+            } => self.handle_event(device_event, evset, vrings, thread_id),
+            VhostUserBackendEvent::IoUringCompletion(_) => Ok(()),
+        }
+    }
 
     /// Initiate transfer of internal state for the purpose of migration to/from the back-end.
     ///
@@ -301,6 +325,27 @@ pub trait VhostUserBackendMut: Send + Sync {
         thread_id: usize,
     ) -> Result<()>;
 
+    /// Handle worker-thread events with access to the shared io_uring.
+    ///
+    /// The default implementation preserves the existing eventfd based behavior for file
+    /// descriptor events and ignores backend io_uring completions.
+    #[cfg(feature = "io-uring")]
+    fn handle_event_with_context(
+        &mut self,
+        event: VhostUserBackendEvent,
+        vrings: &[Self::Vring],
+        thread_id: usize,
+        _context: &mut VhostUserBackendContext<'_>,
+    ) -> Result<()> {
+        match event {
+            VhostUserBackendEvent::Fd {
+                device_event,
+                evset,
+            } => self.handle_event(device_event, evset, vrings, thread_id),
+            VhostUserBackendEvent::IoUringCompletion(_) => Ok(()),
+        }
+    }
+
     /// Initiate transfer of internal state for the purpose of migration to/from the back-end.
     ///
     /// Depending on `direction`, the state should either be saved (i.e. serialized and written to
@@ -413,6 +458,18 @@ impl<T: VhostUserBackend> VhostUserBackend for Arc<T> {
             .handle_event(device_event, evset, vrings, thread_id)
     }
 
+    #[cfg(feature = "io-uring")]
+    fn handle_event_with_context(
+        &self,
+        event: VhostUserBackendEvent,
+        vrings: &[Self::Vring],
+        thread_id: usize,
+        context: &mut VhostUserBackendContext<'_>,
+    ) -> Result<()> {
+        self.deref()
+            .handle_event_with_context(event, vrings, thread_id, context)
+    }
+
     fn set_device_state_fd(
         &self,
         direction: VhostTransferStateDirection,
@@ -505,6 +562,19 @@ impl<T: VhostUserBackendMut> VhostUserBackend for Mutex<T> {
         self.lock()
             .unwrap()
             .handle_event(device_event, evset, vrings, thread_id)
+    }
+
+    #[cfg(feature = "io-uring")]
+    fn handle_event_with_context(
+        &self,
+        event: VhostUserBackendEvent,
+        vrings: &[Self::Vring],
+        thread_id: usize,
+        context: &mut VhostUserBackendContext<'_>,
+    ) -> Result<()> {
+        self.lock()
+            .unwrap()
+            .handle_event_with_context(event, vrings, thread_id, context)
     }
 
     fn set_device_state_fd(
@@ -601,6 +671,19 @@ impl<T: VhostUserBackendMut> VhostUserBackend for RwLock<T> {
         self.write()
             .unwrap()
             .handle_event(device_event, evset, vrings, thread_id)
+    }
+
+    #[cfg(feature = "io-uring")]
+    fn handle_event_with_context(
+        &self,
+        event: VhostUserBackendEvent,
+        vrings: &[Self::Vring],
+        thread_id: usize,
+        context: &mut VhostUserBackendContext<'_>,
+    ) -> Result<()> {
+        self.write()
+            .unwrap()
+            .handle_event_with_context(event, vrings, thread_id, context)
     }
 
     fn set_device_state_fd(
