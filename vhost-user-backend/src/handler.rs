@@ -34,10 +34,12 @@ use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryMmap, G
 use vmm_sys_util::epoll::EventSet;
 
 use super::backend::VhostUserBackend;
+use super::event_loop::VringEpollError;
 use super::event_loop::VringEpollHandler;
-use super::event_loop::{VringEpollError, VringEpollResult};
+#[cfg(feature = "io-uring")]
+use super::iouring::{VringIoUringError, VringIoUringHandler};
 use super::vring::VringT;
-use super::GM;
+use super::{EventLoopBackend, VhostUserDaemonOptions, GM};
 
 // vhost in the kernel usually supports 509 mem slots.
 // The 509 used to be the KVM limit, it supported 512, but 3 were used
@@ -51,6 +53,9 @@ pub enum VhostUserHandlerError {
     CreateVring(VirtQueError),
     /// Failed to create vring worker.
     CreateEpollHandler(VringEpollError),
+    /// Failed to create io_uring vring worker.
+    #[cfg(feature = "io-uring")]
+    CreateIoUringHandler(VringIoUringError),
     /// Failed to spawn vring worker.
     SpawnVringWorker(io::Error),
     /// Could not find the mapping from memory regions.
@@ -65,6 +70,10 @@ impl std::fmt::Display for VhostUserHandlerError {
             }
             VhostUserHandlerError::CreateEpollHandler(e) => {
                 write!(f, "failed to create vring epoll handler: {e}")
+            }
+            #[cfg(feature = "io-uring")]
+            VhostUserHandlerError::CreateIoUringHandler(e) => {
+                write!(f, "failed to create vring io_uring handler: {e}")
             }
             VhostUserHandlerError::SpawnVringWorker(e) => {
                 write!(f, "failed spawning the vring worker: {e}")
@@ -90,7 +99,9 @@ struct AddrMapping {
 
 pub struct VhostUserHandler<T: VhostUserBackend> {
     backend: T,
-    handlers: Vec<Arc<VringEpollHandler<T>>>,
+    epoll_handlers: Vec<Arc<VringEpollHandler<T>>>,
+    #[cfg(feature = "io-uring")]
+    iouring_handlers: Vec<Arc<VringIoUringHandler<T>>>,
     owned: bool,
     features_acked: bool,
     acked_features: u64,
@@ -103,7 +114,7 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     vrings: Vec<T::Vring>,
     #[cfg(feature = "postcopy")]
     uffd: Option<Uffd>,
-    worker_threads: Vec<thread::JoinHandle<VringEpollResult<()>>>,
+    worker_threads: Vec<thread::JoinHandle<()>>,
 }
 
 // Ensure VhostUserHandler: Clone + Send + Sync + 'static.
@@ -114,6 +125,14 @@ where
     T::Bitmap: Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(backend: T, atomic_mem: GM<T::Bitmap>) -> VhostUserHandlerResult<Self> {
+        Self::new_with_options(backend, atomic_mem, VhostUserDaemonOptions::default())
+    }
+
+    pub(crate) fn new_with_options(
+        backend: T,
+        atomic_mem: GM<T::Bitmap>,
+        options: VhostUserDaemonOptions,
+    ) -> VhostUserHandlerResult<Self> {
         let num_queues = backend.num_queues();
         let max_queue_size = backend.max_queue_size();
         let queues_per_thread = backend.queues_per_thread();
@@ -125,7 +144,9 @@ where
             vrings.push(vring);
         }
 
-        let mut handlers = Vec::new();
+        let mut epoll_handlers = Vec::new();
+        #[cfg(feature = "io-uring")]
+        let mut iouring_handlers = Vec::new();
         let mut worker_threads = Vec::new();
         for (thread_id, queues_mask) in queues_per_thread.iter().enumerate() {
             let mut thread_vrings = Vec::new();
@@ -135,23 +156,57 @@ where
                 }
             }
 
-            let handler = Arc::new(
-                VringEpollHandler::new(backend.clone(), thread_vrings, thread_id)
-                    .map_err(VhostUserHandlerError::CreateEpollHandler)?,
-            );
-            let handler2 = handler.clone();
-            let worker_thread = thread::Builder::new()
-                .name("vring_worker".to_string())
-                .spawn(move || handler2.run())
-                .map_err(VhostUserHandlerError::SpawnVringWorker)?;
+            match &options.event_loop {
+                EventLoopBackend::Epoll => {
+                    let handler = Arc::new(
+                        VringEpollHandler::new(backend.clone(), thread_vrings, thread_id)
+                            .map_err(VhostUserHandlerError::CreateEpollHandler)?,
+                    );
+                    let handler2 = handler.clone();
+                    let worker_thread = thread::Builder::new()
+                        .name("vring_worker".to_string())
+                        .spawn(move || {
+                            if let Err(e) = handler2.run() {
+                                error!("Error in vring epoll worker: {e}");
+                            }
+                        })
+                        .map_err(VhostUserHandlerError::SpawnVringWorker)?;
 
-            handlers.push(handler);
-            worker_threads.push(worker_thread);
+                    epoll_handlers.push(handler);
+                    worker_threads.push(worker_thread);
+                }
+                #[cfg(feature = "io-uring")]
+                EventLoopBackend::IoUring(config) => {
+                    let handler = Arc::new(
+                        VringIoUringHandler::new(
+                            backend.clone(),
+                            thread_vrings,
+                            thread_id,
+                            config.clone(),
+                        )
+                        .map_err(VhostUserHandlerError::CreateIoUringHandler)?,
+                    );
+                    let handler2 = handler.clone();
+                    let worker_thread = thread::Builder::new()
+                        .name("vring_iouring_worker".to_string())
+                        .spawn(move || {
+                            if let Err(e) = handler2.run() {
+                                error!("Error in vring io_uring worker: {e}");
+                            }
+                        })
+                        .map_err(VhostUserHandlerError::SpawnVringWorker)?;
+
+                    iouring_handlers.push(handler);
+                    worker_threads.push(worker_thread);
+                }
+            }
         }
 
         Ok(VhostUserHandler {
             backend,
-            handlers,
+            epoll_handlers,
+            #[cfg(feature = "io-uring")]
+            iouring_handlers,
             owned: false,
             features_acked: false,
             acked_features: 0,
@@ -171,7 +226,11 @@ where
 
 impl<T: VhostUserBackend> VhostUserHandler<T> {
     pub(crate) fn send_exit_event(&self) {
-        for handler in self.handlers.iter() {
+        for handler in self.epoll_handlers.iter() {
+            handler.send_exit_event();
+        }
+        #[cfg(feature = "io-uring")]
+        for handler in self.iouring_handlers.iter() {
             handler.send_exit_event();
         }
     }
@@ -192,7 +251,12 @@ where
     T: VhostUserBackend,
 {
     pub(crate) fn get_epoll_handlers(&self) -> Vec<Arc<VringEpollHandler<T>>> {
-        self.handlers.clone()
+        self.epoll_handlers.clone()
+    }
+
+    #[cfg(feature = "io-uring")]
+    pub(crate) fn get_iouring_handlers(&self) -> Vec<Arc<VringIoUringHandler<T>>> {
+        self.iouring_handlers.clone()
     }
 
     fn vring_needs_init(&self, vring: &T::Vring) -> bool {
@@ -208,7 +272,7 @@ where
         self.update_vring_registration(vring, index)
     }
 
-    /// Adds or removes the vring's kick fd to the epoll instance based on the vring status.
+    /// Adds or removes the vring's kick fd to the worker based on the vring status.
     /// Ensures that notifications are handled only while the vring is both started and enabled
     /// and that no notifications are lost.
     fn update_vring_registration(&self, vring: &T::Vring, index: u8) -> VhostUserResult<()> {
@@ -219,7 +283,8 @@ where
                 if shifted_queues_mask & 1u64 == 1u64 {
                     let evt_idx = queues_mask.count_ones() - shifted_queues_mask.count_ones();
                     if vring_state.get_queue().ready() && vring_state.is_enabled() {
-                        if let Err(e) = self.handlers[thread_index].register_event(
+                        if let Err(e) = self.register_worker_event(
+                            thread_index,
                             fd.as_raw_fd(),
                             EventSet::IN,
                             u64::from(evt_idx),
@@ -231,7 +296,8 @@ where
                             }
                         }
                     } else {
-                        let _ = self.handlers[thread_index].unregister_event(
+                        let _ = self.unregister_worker_event(
+                            thread_index,
                             fd.as_raw_fd(),
                             EventSet::IN,
                             u64::from(evt_idx),
@@ -251,6 +317,44 @@ where
         } else {
             Err(VhostUserError::InactiveFeature(feat))
         }
+    }
+
+    fn register_worker_event(
+        &self,
+        thread_index: usize,
+        fd: i32,
+        evset: EventSet,
+        data: u64,
+    ) -> io::Result<()> {
+        if !self.epoll_handlers.is_empty() {
+            return self.epoll_handlers[thread_index].register_event(fd, evset, data);
+        }
+
+        #[cfg(feature = "io-uring")]
+        if !self.iouring_handlers.is_empty() {
+            return self.iouring_handlers[thread_index].register_event(fd, evset, data);
+        }
+
+        Err(io::Error::other("no vring worker registered"))
+    }
+
+    fn unregister_worker_event(
+        &self,
+        thread_index: usize,
+        fd: i32,
+        evset: EventSet,
+        data: u64,
+    ) -> io::Result<()> {
+        if !self.epoll_handlers.is_empty() {
+            return self.epoll_handlers[thread_index].unregister_event(fd, evset, data);
+        }
+
+        #[cfg(feature = "io-uring")]
+        if !self.iouring_handlers.is_empty() {
+            return self.iouring_handlers[thread_index].unregister_event(fd, evset, data);
+        }
+
+        Err(io::Error::other("no vring worker registered"))
     }
 }
 
