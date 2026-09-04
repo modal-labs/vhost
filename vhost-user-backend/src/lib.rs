@@ -23,6 +23,8 @@ use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use self::handler::VhostUserHandler;
 
 mod backend;
+#[cfg(feature = "postcopy")]
+pub use self::backend::PostcopyRegistrationMode;
 pub use self::backend::{VhostUserBackend, VhostUserBackendMut};
 
 mod event_loop;
