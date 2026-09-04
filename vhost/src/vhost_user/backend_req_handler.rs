@@ -489,12 +489,16 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         };
 
         #[cfg(feature = "postcopy")]
-        if self.handle_postcopy_ack(&hdr, size, &buf, &files)? {
-            return Ok(());
+        if matches!(
+            self.postcopy_state,
+            PostcopyState::Listening | PostcopyState::AwaitingAck(FrontendReq::SET_MEM_TABLE)
+        ) && is_vring_request(hdr.get_code()?)
+        {
+            return Err(Error::InvalidOperation("vring unavailable during postcopy"));
         }
         #[cfg(feature = "postcopy")]
-        if self.postcopy_state == PostcopyState::Listening && is_vring_request(hdr.get_code()?) {
-            return Err(Error::InvalidOperation("vring unavailable during postcopy"));
+        if self.handle_postcopy_ack(&hdr, size, &buf, &files)? {
+            return Ok(());
         }
 
         match hdr.get_code() {
@@ -1549,6 +1553,25 @@ mod tests {
             handler.postcopy_state,
             PostcopyState::AwaitingAck(FrontendReq::SET_MEM_TABLE)
         );
+
+        let vring = VhostUserVringAddr::new(
+            0,
+            VhostUserVringAddrFlags::empty(),
+            0x3000,
+            0x4000,
+            0x5000,
+            0,
+        );
+        let vring_hdr = VhostUserMsgHeader::new(
+            FrontendReq::SET_VRING_ADDR,
+            0x1,
+            mem::size_of::<VhostUserVringAddr>() as u32,
+        );
+        peer.send_message(&vring_hdr, &vring, None).unwrap();
+        assert!(matches!(
+            handler.handle_request(),
+            Err(Error::InvalidOperation("vring unavailable during postcopy"))
+        ));
 
         let ack = VhostUserU64::new(0);
         let ack_hdr = VhostUserMsgHeader::new(FrontendReq::SET_MEM_TABLE, 0x1, 8);

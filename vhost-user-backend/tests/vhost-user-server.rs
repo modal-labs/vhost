@@ -364,6 +364,10 @@ fn vhost_user_postcopy_end(path: &Path, barrier: Arc<Barrier>) {
     let mut frontend = setup_frontend(path, barrier);
     let _uffd_file = frontend.postcopy_advise().unwrap();
     frontend.postcopy_listen().unwrap();
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(0x1000).unwrap();
+    let region = VhostUserMemoryRegionInfo::new(0x900000, 0x1000, 0xdead000, 0, file.as_raw_fd());
+    frontend.add_mem_region_postcopy(&region).unwrap();
     frontend.postcopy_end().unwrap();
 }
 
@@ -372,6 +376,13 @@ fn vhost_user_postcopy_end(path: &Path, barrier: Arc<Barrier>) {
 #[cfg(feature = "postcopy")]
 #[test]
 fn test_vhost_user_postcopy() {
+    if userfaultfd::UffdBuilder::new()
+        .user_mode_only(false)
+        .create()
+        .is_err()
+    {
+        return;
+    }
     vhost_user_server(vhost_user_postcopy_advise);
     vhost_user_server(vhost_user_postcopy_listen);
     vhost_user_server(vhost_user_postcopy_end);
