@@ -9,6 +9,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+#[cfg(feature = "postcopy")]
+use std::slice;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use vm_memory::ByteValued;
@@ -24,6 +26,13 @@ use crate::{Error, Result};
 
 /// Trait for vhost-user frontend to provide extra methods not covered by the VhostBackend yet.
 pub trait VhostUserFrontend: VhostBackend {
+    /// Set guest memory and complete the postcopy mapping barrier.
+    #[cfg(feature = "postcopy")]
+    fn set_mem_table_postcopy(
+        &mut self,
+        regions: &[VhostUserMemoryRegionInfo],
+    ) -> Result<Vec<VhostUserPostcopyMapping>>;
+
     /// Get the protocol feature bitmask from the underlying vhost implementation.
     fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures>;
 
@@ -77,6 +86,13 @@ pub trait VhostUserFrontend: VhostBackend {
     /// Add a new guest memory mapping for vhost to use.
     fn add_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()>;
 
+    /// Add guest memory and complete the postcopy mapping barrier.
+    #[cfg(feature = "postcopy")]
+    fn add_mem_region_postcopy(
+        &mut self,
+        region: &VhostUserMemoryRegionInfo,
+    ) -> Result<VhostUserPostcopyMapping>;
+
     /// Remove a guest memory mapping from vhost.
     fn remove_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()>;
 
@@ -118,6 +134,70 @@ pub trait VhostUserFrontend: VhostBackend {
     fn postcopy_end(&mut self) -> Result<()>;
 }
 
+/// A backend mapping returned during the postcopy memory handshake.
+#[cfg(feature = "postcopy")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VhostUserPostcopyMapping {
+    /// Address of the mapping in the backend process.
+    pub backend_addr: u64,
+    /// Guest physical address of the mapping.
+    pub guest_phys_addr: u64,
+    /// Length of the mapping.
+    pub length: u64,
+    /// Offset of the mapping in its shared-memory file.
+    pub file_offset: u64,
+}
+
+#[cfg(feature = "postcopy")]
+fn validate_postcopy_mapping(
+    expected: &VhostUserMemoryRegionInfo,
+    actual: &VhostUserMemoryRegion,
+) -> Result<VhostUserPostcopyMapping> {
+    let guest_phys_addr = actual.guest_phys_addr;
+    let length = actual.memory_size;
+    let backend_addr = actual.user_addr;
+    let file_offset = actual.mmap_offset;
+    if guest_phys_addr != expected.guest_phys_addr
+        || length != expected.memory_size
+        || file_offset != expected.mmap_offset
+        || backend_addr.checked_add(length).is_none()
+    {
+        return error_code(VhostUserError::InvalidMessage);
+    }
+    Ok(VhostUserPostcopyMapping {
+        backend_addr,
+        guest_phys_addr,
+        length,
+        file_offset,
+    })
+}
+
+#[cfg(feature = "postcopy")]
+fn validate_postcopy_mappings(
+    expected: &[VhostUserMemoryRegionInfo],
+    actual: &[VhostUserMemoryRegion],
+) -> Result<Vec<VhostUserPostcopyMapping>> {
+    if expected.len() != actual.len() {
+        return error_code(VhostUserError::InvalidMessage);
+    }
+    expected
+        .iter()
+        .zip(actual)
+        .map(|(expected, actual)| validate_postcopy_mapping(expected, actual))
+        .collect()
+}
+
+#[cfg(feature = "postcopy")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostcopyState {
+    Inactive,
+    Advised,
+    Listening,
+    AwaitingAck,
+    Active,
+    Ended,
+}
+
 fn error_code<T>(err: VhostUserError) -> Result<T> {
     Err(Error::VhostUserProtocol(err))
 }
@@ -142,6 +222,8 @@ impl Frontend {
                 max_queue_num,
                 error: None,
                 hdr_flags: VhostUserHeaderFlag::empty(),
+                #[cfg(feature = "postcopy")]
+                postcopy_state: PostcopyState::Inactive,
             })),
         }
     }
@@ -225,7 +307,12 @@ impl VhostBackend for Frontend {
     fn reset_owner(&self) -> Result<()> {
         let mut node = self.node();
         let hdr = node.send_request_header(FrontendReq::RESET_OWNER, None)?;
-        node.wait_for_ack(&hdr).map_err(|e| e.into())
+        node.wait_for_ack(&hdr)?;
+        #[cfg(feature = "postcopy")]
+        {
+            node.postcopy_state = PostcopyState::Inactive;
+        }
+        Ok(())
     }
 
     /// Set the memory map regions on the backend so it can translate the vring
@@ -245,6 +332,8 @@ impl VhostBackend for Frontend {
         }
 
         let mut node = self.node();
+        #[cfg(feature = "postcopy")]
+        node.check_ordinary_memory_update()?;
         let body = VhostUserMemory::new(ctx.regions.len() as u32);
         // SAFETY: Safe because ctx.regions is a valid Vec() at this point.
         let (_, payload, _) = unsafe { ctx.regions.align_to::<u8>() };
@@ -384,6 +473,52 @@ impl VhostBackend for Frontend {
 }
 
 impl VhostUserFrontend for Frontend {
+    #[cfg(feature = "postcopy")]
+    fn set_mem_table_postcopy(
+        &mut self,
+        regions: &[VhostUserMemoryRegionInfo],
+    ) -> Result<Vec<VhostUserPostcopyMapping>> {
+        if regions.is_empty() || regions.len() > MAX_ATTACHED_FD_ENTRIES {
+            return error_code(VhostUserError::InvalidParam);
+        }
+
+        let mut ctx = VhostUserMemoryContext::new();
+        for region in regions {
+            if region.memory_size == 0 || region.mmap_handle < 0 {
+                return error_code(VhostUserError::InvalidParam);
+            }
+            ctx.append(&region.to_region(), region.mmap_handle);
+        }
+
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        node.check_postcopy_memory_update(false)?;
+        let body = VhostUserMemory::new(ctx.regions.len() as u32);
+        // SAFETY: `ctx.regions` is initialized and POD.
+        let (_, payload, _) = unsafe { ctx.regions.align_to::<u8>() };
+        let hdr = node.send_request_with_payload(
+            FrontendReq::SET_MEM_TABLE,
+            &body,
+            payload,
+            Some(ctx.fds.as_slice()),
+        )?;
+        node.postcopy_state = PostcopyState::AwaitingAck;
+        let (reply, payload, _) = node.recv_reply_with_payload::<VhostUserMemory>(&hdr)?;
+        if reply.num_regions as usize != regions.len() {
+            return error_code(VhostUserError::InvalidMessage);
+        }
+        let reply_regions = unsafe {
+            slice::from_raw_parts(
+                payload.as_ptr() as *const VhostUserMemoryRegion,
+                regions.len(),
+            )
+        };
+        let mappings = validate_postcopy_mappings(regions, reply_regions)?;
+        node.send_postcopy_ack(FrontendReq::SET_MEM_TABLE)?;
+        node.postcopy_state = PostcopyState::Active;
+        Ok(mappings)
+    }
+
     fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures> {
         let mut node = self.node();
         node.check_feature(VhostUserVirtioFeatures::PROTOCOL_FEATURES)?;
@@ -425,7 +560,12 @@ impl VhostUserFrontend for Frontend {
         node.check_proto_feature(VhostUserProtocolFeatures::RESET_DEVICE)?;
 
         let hdr = node.send_request_header(FrontendReq::RESET_DEVICE, None)?;
-        node.wait_for_ack(&hdr).map_err(|e| e.into())
+        node.wait_for_ack(&hdr)?;
+        #[cfg(feature = "postcopy")]
+        {
+            node.postcopy_state = PostcopyState::Inactive;
+        }
+        Ok(())
     }
 
     fn set_vring_enable(&mut self, queue_index: usize, enable: bool) -> Result<()> {
@@ -563,6 +703,8 @@ impl VhostUserFrontend for Frontend {
 
     fn add_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
         let mut node = self.node();
+        #[cfg(feature = "postcopy")]
+        node.check_ordinary_memory_update()?;
         node.check_proto_feature(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS)?;
         if region.memory_size == 0 || region.mmap_handle < 0 {
             return error_code(VhostUserError::InvalidParam);
@@ -572,6 +714,33 @@ impl VhostUserFrontend for Frontend {
         let fds = [region.mmap_handle];
         let hdr = node.send_request_with_body(FrontendReq::ADD_MEM_REG, &body, Some(&fds))?;
         node.wait_for_ack(&hdr).map_err(|e| e.into())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn add_mem_region_postcopy(
+        &mut self,
+        region: &VhostUserMemoryRegionInfo,
+    ) -> Result<VhostUserPostcopyMapping> {
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS)?;
+        node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        node.check_postcopy_memory_update(true)?;
+        if region.memory_size == 0 || region.mmap_handle < 0 {
+            return error_code(VhostUserError::InvalidParam);
+        }
+
+        let body = region.to_single_region();
+        let hdr = node.send_request_with_body(
+            FrontendReq::ADD_MEM_REG,
+            &body,
+            Some(&[region.mmap_handle]),
+        )?;
+        node.postcopy_state = PostcopyState::AwaitingAck;
+        let reply = node.recv_reply::<VhostUserSingleMemoryRegion>(&hdr)?;
+        let mapping = validate_postcopy_mapping(region, &reply)?;
+        node.send_postcopy_ack(FrontendReq::ADD_MEM_REG)?;
+        node.postcopy_state = PostcopyState::Active;
+        Ok(mapping)
     }
 
     fn remove_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
@@ -647,12 +816,18 @@ impl VhostUserFrontend for Frontend {
     fn postcopy_advise(&mut self) -> Result<File> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        if node.postcopy_state != PostcopyState::Inactive {
+            return error_code(VhostUserError::InvalidOperation("invalid postcopy state"));
+        }
 
         let hdr = node.send_request_header(FrontendReq::POSTCOPY_ADVISE, None)?;
         let (_, files) = node.recv_reply_with_files::<VhostUserEmpty>(&hdr)?;
 
         match take_single_file(files) {
-            Some(file) => Ok(file),
+            Some(file) => {
+                node.postcopy_state = PostcopyState::Advised;
+                Ok(file)
+            }
             None => error_code(VhostUserError::IncorrectFds),
         }
     }
@@ -661,16 +836,26 @@ impl VhostUserFrontend for Frontend {
     fn postcopy_listen(&mut self) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        if node.postcopy_state != PostcopyState::Advised {
+            return error_code(VhostUserError::InvalidOperation("invalid postcopy state"));
+        }
         let hdr = node.send_request_header(FrontendReq::POSTCOPY_LISTEN, None)?;
-        node.wait_for_ack(&hdr).map_err(|e| e.into())
+        node.wait_for_ack(&hdr)?;
+        node.postcopy_state = PostcopyState::Listening;
+        Ok(())
     }
 
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        if node.postcopy_state != PostcopyState::Active {
+            return error_code(VhostUserError::InvalidOperation("invalid postcopy state"));
+        }
         let hdr = node.send_request_header(FrontendReq::POSTCOPY_END, None)?;
-        node.wait_for_ack(&hdr).map_err(|e| e.into())
+        node.wait_for_ack(&hdr)?;
+        node.postcopy_state = PostcopyState::Ended;
+        Ok(())
     }
 }
 
@@ -722,9 +907,40 @@ struct FrontendInternal {
     error: Option<i32>,
     // List of header flags.
     hdr_flags: VhostUserHeaderFlag,
+    #[cfg(feature = "postcopy")]
+    postcopy_state: PostcopyState,
 }
 
 impl FrontendInternal {
+    #[cfg(feature = "postcopy")]
+    fn check_ordinary_memory_update(&self) -> VhostUserResult<()> {
+        match self.postcopy_state {
+            PostcopyState::Inactive | PostcopyState::Advised => Ok(()),
+            _ => Err(VhostUserError::InvalidOperation(
+                "postcopy memory update required",
+            )),
+        }
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn check_postcopy_memory_update(&self, addition: bool) -> VhostUserResult<()> {
+        match self.postcopy_state {
+            PostcopyState::Listening => Ok(()),
+            PostcopyState::Active if addition => Ok(()),
+            _ => Err(VhostUserError::InvalidOperation("invalid postcopy state")),
+        }
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn send_postcopy_ack(&mut self, code: FrontendReq) -> VhostUserResult<()> {
+        self.check_state()?;
+        let flags = (self.hdr_flags.bits() & !VhostUserHeaderFlag::NEED_REPLY.bits()) | 0x1;
+        let hdr = VhostUserMsgHeader::new(code, flags, mem::size_of::<VhostUserU64>() as u32);
+        self.main_sock
+            .send_message(&hdr, &VhostUserU64::new(0), None)?;
+        Ok(())
+    }
+
     fn send_request_header(
         &mut self,
         code: FrontendReq,
