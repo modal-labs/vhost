@@ -37,6 +37,17 @@ use vhost::vhost_user::GpuBackend;
 use super::vring::VringT;
 use super::GM;
 
+/// userfaultfd registration mode used for postcopy memory.
+#[cfg(feature = "postcopy")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PostcopyRegistrationMode {
+    /// Report missing-page faults.
+    #[default]
+    Missing,
+    /// Report missing and minor faults on shared memory.
+    MinorShmem,
+}
+
 /// Trait with interior mutability for vhost user backend servers to implement concrete services.
 ///
 /// To support multi-threading and asynchronous IO, we enforce `Send + Sync` bound.
@@ -58,6 +69,12 @@ pub trait VhostUserBackend: Send + Sync {
 
     /// Get available vhost protocol features.
     fn protocol_features(&self) -> VhostUserProtocolFeatures;
+
+    /// Select the userfaultfd registration mode for postcopy memory.
+    #[cfg(feature = "postcopy")]
+    fn postcopy_registration_mode(&self) -> PostcopyRegistrationMode {
+        PostcopyRegistrationMode::Missing
+    }
 
     /// Reset the emulated device state.
     ///
@@ -208,6 +225,12 @@ pub trait VhostUserBackendMut: Send + Sync {
 
     /// Get available vhost protocol features.
     fn protocol_features(&self) -> VhostUserProtocolFeatures;
+
+    /// Select the userfaultfd registration mode for postcopy memory.
+    #[cfg(feature = "postcopy")]
+    fn postcopy_registration_mode(&self) -> PostcopyRegistrationMode {
+        PostcopyRegistrationMode::Missing
+    }
 
     /// Reset the emulated device state.
     ///
@@ -362,6 +385,11 @@ impl<T: VhostUserBackend> VhostUserBackend for Arc<T> {
         self.deref().protocol_features()
     }
 
+    #[cfg(feature = "postcopy")]
+    fn postcopy_registration_mode(&self) -> PostcopyRegistrationMode {
+        self.deref().postcopy_registration_mode()
+    }
+
     fn reset_device(&self) {
         self.deref().reset_device()
     }
@@ -453,6 +481,11 @@ impl<T: VhostUserBackendMut> VhostUserBackend for Mutex<T> {
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         self.lock().unwrap().protocol_features()
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn postcopy_registration_mode(&self) -> PostcopyRegistrationMode {
+        self.lock().unwrap().postcopy_registration_mode()
     }
 
     fn reset_device(&self) {
@@ -549,6 +582,11 @@ impl<T: VhostUserBackendMut> VhostUserBackend for RwLock<T> {
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
         self.read().unwrap().protocol_features()
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn postcopy_registration_mode(&self) -> PostcopyRegistrationMode {
+        self.read().unwrap().postcopy_registration_mode()
     }
 
     fn reset_device(&self) {
