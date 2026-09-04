@@ -15,7 +15,7 @@ use std::thread;
 
 use crate::bitmap::{BitmapReplace, MemRegionBitmap, MmapLogReg};
 #[cfg(feature = "postcopy")]
-use userfaultfd::{Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vhost::vhost_user::message::{
     VhostTransferStateDirection, VhostTransferStatePhase, VhostUserConfigFlags, VhostUserLog,
     VhostUserMemoryRegion, VhostUserProtocolFeatures, VhostUserShMemConfig, VhostUserSharedMsg,
@@ -35,8 +35,10 @@ use vm_memory::{
 };
 use vmm_sys_util::epoll::EventSet;
 
+#[cfg(feature = "postcopy")]
+use super::backend::PostcopyRegistrationMode;
 use super::backend::VhostUserBackend;
-use super::event_loop::VringEpollHandler;
+use super::event_loop::{EventGate, VringEpollHandler};
 use super::event_loop::{VringEpollError, VringEpollResult};
 use super::vring::VringT;
 use super::GM;
@@ -81,7 +83,7 @@ impl error::Error for VhostUserHandlerError {}
 /// Result of vhost-user handler operations.
 pub type VhostUserHandlerResult<T> = std::result::Result<T, VhostUserHandlerError>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct AddrMapping {
     #[cfg(feature = "postcopy")]
     local_addr: u64,
@@ -89,6 +91,15 @@ struct AddrMapping {
     size: u64,
     gpa_base: u64,
 }
+
+#[cfg(feature = "postcopy")]
+type SetMemoryResult = Vec<u64>;
+#[cfg(not(feature = "postcopy"))]
+type SetMemoryResult = ();
+#[cfg(feature = "postcopy")]
+type AddMemoryResult = u64;
+#[cfg(not(feature = "postcopy"))]
+type AddMemoryResult = ();
 
 pub struct VhostUserHandler<T: VhostUserBackend> {
     backend: T,
@@ -105,7 +116,15 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     vrings: Vec<T::Vring>,
     #[cfg(feature = "postcopy")]
     uffd: Option<Uffd>,
+    #[cfg(feature = "postcopy")]
+    pending_mem: Option<GuestMemoryMmap<T::Bitmap>>,
+    #[cfg(feature = "postcopy")]
+    pending_mappings: Vec<AddrMapping>,
+    #[cfg(feature = "postcopy")]
+    postcopy_listening: bool,
     worker_threads: Vec<thread::JoinHandle<VringEpollResult<()>>>,
+    #[cfg(feature = "postcopy")]
+    event_gate: Arc<EventGate>,
 }
 
 // Ensure VhostUserHandler: Clone + Send + Sync + 'static.
@@ -129,6 +148,7 @@ where
 
         let mut handlers = Vec::new();
         let mut worker_threads = Vec::new();
+        let event_gate = Arc::new(EventGate::default());
         for (thread_id, queues_mask) in queues_per_thread.iter().enumerate() {
             let mut thread_vrings = Vec::new();
             for (index, vring) in vrings.iter().enumerate() {
@@ -138,8 +158,13 @@ where
             }
 
             let handler = Arc::new(
-                VringEpollHandler::new(backend.clone(), thread_vrings, thread_id)
-                    .map_err(VhostUserHandlerError::CreateEpollHandler)?,
+                VringEpollHandler::new_with_gate(
+                    backend.clone(),
+                    thread_vrings,
+                    thread_id,
+                    event_gate.clone(),
+                )
+                .map_err(VhostUserHandlerError::CreateEpollHandler)?,
             );
             let handler2 = handler.clone();
             let worker_thread = thread::Builder::new()
@@ -166,13 +191,23 @@ where
             vrings,
             #[cfg(feature = "postcopy")]
             uffd: None,
+            #[cfg(feature = "postcopy")]
+            pending_mem: None,
+            #[cfg(feature = "postcopy")]
+            pending_mappings: Vec::new(),
+            #[cfg(feature = "postcopy")]
+            postcopy_listening: false,
             worker_threads,
+            #[cfg(feature = "postcopy")]
+            event_gate,
         })
     }
 }
 
 impl<T: VhostUserBackend> VhostUserHandler<T> {
     pub(crate) fn send_exit_event(&self) {
+        #[cfg(feature = "postcopy")]
+        self.event_gate.stop();
         for handler in self.handlers.iter() {
             handler.send_exit_event();
         }
@@ -187,12 +222,42 @@ impl<T: VhostUserBackend> VhostUserHandler<T> {
 
         Err(VhostUserHandlerError::MissingMemoryMapping)
     }
+
+    #[cfg(feature = "postcopy")]
+    fn cleanup_postcopy(&mut self) {
+        self.uffd = None;
+        self.pending_mem = None;
+        self.pending_mappings.clear();
+        self.postcopy_listening = false;
+        self.event_gate.resume();
+    }
 }
 
 impl<T> VhostUserHandler<T>
 where
     T: VhostUserBackend,
 {
+    #[cfg(feature = "postcopy")]
+    fn register_postcopy_mapping(&self, mapping: &AddrMapping) -> VhostUserResult<()> {
+        let uffd = self.uffd.as_ref().ok_or(VhostUserError::InvalidOperation(
+            "no registered UFFD handler",
+        ))?;
+        let mode = self.backend.postcopy_registration_mode();
+        let register_mode = match mode {
+            PostcopyRegistrationMode::Missing => RegisterMode::MISSING,
+            PostcopyRegistrationMode::MinorShmem => RegisterMode::MISSING | RegisterMode::MINOR,
+        };
+        uffd.register_with_mode(
+            mapping.local_addr as *mut libc::c_void,
+            mapping.size as usize,
+            register_mode,
+        )
+        .map_err(|e| {
+            VhostUserError::ReqHandlerError(postcopy_uffd_error(e, mode, "registration mode"))
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn get_epoll_handlers(&self) -> Vec<Arc<VringEpollHandler<T>>> {
         self.handlers.clone()
     }
@@ -256,6 +321,35 @@ where
     }
 }
 
+#[cfg(feature = "postcopy")]
+fn postcopy_uffd_error(
+    error: userfaultfd::Error,
+    mode: PostcopyRegistrationMode,
+    requested: &str,
+) -> io::Error {
+    let unsupported = match &error {
+        userfaultfd::Error::SystemError(errno) => {
+            *errno as i32 == libc::EINVAL || *errno as i32 == libc::EOPNOTSUPP
+        }
+        userfaultfd::Error::UnsupportedIoctls(_) => true,
+        _ => false,
+    };
+    if unsupported
+        && (mode == PostcopyRegistrationMode::MinorShmem || requested == "registration mode")
+    {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{mode:?} postcopy {requested} is unsupported"),
+        )
+    } else {
+        match error {
+            userfaultfd::Error::SystemError(errno) => io::Error::from_raw_os_error(errno as i32),
+            userfaultfd::Error::OpenDevUserfaultfd(error) => error,
+            error => io::Error::other(error),
+        }
+    }
+}
+
 impl<T: VhostUserBackend> VhostUserBackendReqHandlerMut for VhostUserHandler<T>
 where
     T::Bitmap: BitmapReplace + NewBitmap + Clone,
@@ -273,6 +367,8 @@ where
         self.features_acked = false;
         self.acked_features = 0;
         self.acked_protocol_features = 0;
+        #[cfg(feature = "postcopy")]
+        self.cleanup_postcopy();
         Ok(())
     }
 
@@ -287,6 +383,8 @@ where
         self.features_acked = false;
         self.acked_features = 0;
         self.backend.reset_device();
+        #[cfg(feature = "postcopy")]
+        self.cleanup_postcopy();
         Ok(())
     }
 
@@ -331,7 +429,7 @@ where
         &mut self,
         ctx: &[VhostUserMemoryRegion],
         files: Vec<File>,
-    ) -> VhostUserResult<()> {
+    ) -> VhostUserResult<SetMemoryResult> {
         // We need to create tuple of ranges from the list of VhostUserMemoryRegion
         // that we get from the caller.
         let mut regions = Vec::new();
@@ -358,6 +456,17 @@ where
         let mem = GuestMemoryMmap::from_regions(regions)
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
 
+        #[cfg(feature = "postcopy")]
+        if self.postcopy_listening {
+            for mapping in &mappings {
+                self.register_postcopy_mapping(mapping)?;
+            }
+            let bases = mappings.iter().map(|mapping| mapping.local_addr).collect();
+            self.pending_mem = Some(mem);
+            self.pending_mappings = mappings;
+            return Ok(bases);
+        }
+
         // Updating the inner GuestMemory object here will cause all our vrings to
         // see the new one the next time they call to `atomic_mem.memory()`.
         self.atomic_mem.lock().unwrap().replace(mem);
@@ -367,6 +476,13 @@ where
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
         self.mappings = mappings;
 
+        #[cfg(feature = "postcopy")]
+        return Ok(self
+            .mappings
+            .iter()
+            .map(|mapping| mapping.local_addr)
+            .collect());
+        #[cfg(not(feature = "postcopy"))]
         Ok(())
     }
 
@@ -622,7 +738,7 @@ where
         &mut self,
         region: &VhostUserSingleMemoryRegion,
         file: File,
-    ) -> VhostUserResult<()> {
+    ) -> VhostUserResult<AddMemoryResult> {
         let guest_region = Arc::new(
             GuestRegionMmap::new(
                 region.mmap_region(file)?,
@@ -641,11 +757,29 @@ where
             gpa_base: region.guest_phys_addr,
         };
 
-        let mem = self
-            .atomic_mem
-            .memory()
+        #[cfg(feature = "postcopy")]
+        let current_mem = self
+            .pending_mem
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| (*self.atomic_mem.memory()).clone());
+        #[cfg(not(feature = "postcopy"))]
+        let current_mem = self.atomic_mem.memory();
+        let mem = current_mem
             .insert_region(guest_region)
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+
+        #[cfg(feature = "postcopy")]
+        if self.postcopy_listening {
+            self.register_postcopy_mapping(&addr_mapping)?;
+            let local_addr = addr_mapping.local_addr;
+            if self.pending_mem.is_none() {
+                self.pending_mappings = self.mappings.clone();
+            }
+            self.pending_mem = Some(mem);
+            self.pending_mappings.push(addr_mapping);
+            return Ok(local_addr);
+        }
 
         self.atomic_mem.lock().unwrap().replace(mem);
 
@@ -655,6 +789,9 @@ where
 
         self.mappings.push(addr_mapping);
 
+        #[cfg(feature = "postcopy")]
+        return Ok(self.mappings.last().unwrap().local_addr);
+        #[cfg(not(feature = "postcopy"))]
         Ok(())
     }
 
@@ -704,12 +841,23 @@ where
     fn postcopy_advice(&mut self) -> VhostUserResult<File> {
         let mut uffd_builder = UffdBuilder::new();
 
+        if self.backend.postcopy_registration_mode() == PostcopyRegistrationMode::MinorShmem {
+            const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
+            uffd_builder.require_features(FeatureFlags::from_bits_retain(UFFD_FEATURE_MINOR_SHMEM));
+        }
+
         let uffd = uffd_builder
             .close_on_exec(true)
             .non_blocking(true)
             .user_mode_only(false)
             .create()
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+            .map_err(|e| {
+                VhostUserError::ReqHandlerError(postcopy_uffd_error(
+                    e,
+                    self.backend.postcopy_registration_mode(),
+                    "feature",
+                ))
+            })?;
 
         // We need to duplicate the uffd fd because we need both
         // to return File with fd and store fd inside uffd.
@@ -734,26 +882,37 @@ where
 
     #[cfg(feature = "postcopy")]
     fn postcopy_listen(&mut self) -> VhostUserResult<()> {
-        let Some(ref uffd) = self.uffd else {
+        if self.uffd.is_none() {
             return Err(VhostUserError::ReqHandlerError(io::Error::other(
                 "No registered UFFD handler",
             )));
-        };
-
-        for mapping in self.mappings.iter() {
-            uffd.register(
-                mapping.local_addr as *mut libc::c_void,
-                mapping.size as usize,
-            )
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
         }
+        self.postcopy_listening = true;
+        self.event_gate.suspend();
+        Ok(())
+    }
 
+    #[cfg(feature = "postcopy")]
+    fn postcopy_memory_ack(&mut self) -> VhostUserResult<()> {
+        let mem = self
+            .pending_mem
+            .take()
+            .ok_or(VhostUserError::InvalidOperation(
+                "no pending postcopy memory",
+            ))?;
+        let mappings = std::mem::take(&mut self.pending_mappings);
+        self.atomic_mem.lock().unwrap().replace(mem);
+        self.backend
+            .update_memory(self.atomic_mem.clone())
+            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+        self.mappings = mappings;
+        self.event_gate.resume();
         Ok(())
     }
 
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> VhostUserResult<()> {
-        self.uffd = None;
+        self.cleanup_postcopy();
         Ok(())
     }
 
