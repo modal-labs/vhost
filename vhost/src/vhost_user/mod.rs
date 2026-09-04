@@ -28,6 +28,8 @@ pub use self::connection::Listener;
 
 #[cfg(feature = "vhost-user-frontend")]
 mod frontend;
+#[cfg(all(feature = "vhost-user-frontend", feature = "postcopy"))]
+pub use self::frontend::VhostUserPostcopyMapping;
 #[cfg(feature = "vhost-user-frontend")]
 pub use self::frontend::{Frontend, VhostUserFrontend};
 #[cfg(feature = "vhost-user")]
