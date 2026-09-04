@@ -118,8 +118,18 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(())
     }
 
+    #[cfg(not(feature = "postcopy"))]
     fn set_mem_table(&mut self, _ctx: &[VhostUserMemoryRegion], _files: Vec<File>) -> Result<()> {
         Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn set_mem_table(
+        &mut self,
+        ctx: &[VhostUserMemoryRegion],
+        _files: Vec<File>,
+    ) -> Result<Vec<u64>> {
+        Ok(ctx.iter().map(|region| region.user_addr).collect())
     }
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> Result<()> {
@@ -309,8 +319,14 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(MAX_MEM_SLOTS as u64)
     }
 
+    #[cfg(not(feature = "postcopy"))]
     fn add_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion, _fd: File) -> Result<()> {
         Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, _fd: File) -> Result<u64> {
+        Ok(region.user_addr)
     }
 
     fn remove_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion) -> Result<()> {
@@ -353,6 +369,11 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
 
     #[cfg(feature = "postcopy")]
     fn postcopy_listen(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn postcopy_memory_ack(&mut self) -> Result<()> {
         Ok(())
     }
 

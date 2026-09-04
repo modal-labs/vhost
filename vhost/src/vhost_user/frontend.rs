@@ -986,7 +986,7 @@ impl FrontendInternal {
     #[cfg(feature = "postcopy")]
     fn check_ordinary_memory_update(&self) -> VhostUserResult<()> {
         match self.postcopy_state {
-            PostcopyState::Inactive | PostcopyState::Advised => Ok(()),
+            PostcopyState::Inactive | PostcopyState::Advised | PostcopyState::Ended => Ok(()),
             _ => Err(VhostUserError::InvalidOperation(
                 "postcopy memory update required",
             )),
