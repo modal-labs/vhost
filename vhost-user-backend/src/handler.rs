@@ -117,6 +117,8 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     #[cfg(feature = "postcopy")]
     uffd: Option<Uffd>,
     #[cfg(feature = "postcopy")]
+    pub(crate) uffd_device: Option<File>,
+    #[cfg(feature = "postcopy")]
     pending_mem: Option<GuestMemoryMmap<T::Bitmap>>,
     #[cfg(feature = "postcopy")]
     pending_mappings: Vec<AddrMapping>,
@@ -191,6 +193,8 @@ where
             vrings,
             #[cfg(feature = "postcopy")]
             uffd: None,
+            #[cfg(feature = "postcopy")]
+            uffd_device: None,
             #[cfg(feature = "postcopy")]
             pending_mem: None,
             #[cfg(feature = "postcopy")]
@@ -319,6 +323,41 @@ where
             Err(VhostUserError::InactiveFeature(feat))
         }
     }
+}
+
+#[cfg(feature = "postcopy")]
+fn create_device_uffd(device: &File, mode: PostcopyRegistrationMode) -> io::Result<Uffd> {
+    use userfaultfd_sys::{uffdio_api, UFFDIO_API, UFFD_API, UFFD_FEATURE_MINOR_SHMEM};
+
+    // USERFAULTFD_IOC_NEW takes creation flags as an integer, not a pointer.
+    let request = libc::_IO(userfaultfd_sys::USERFAULTFD_IOC, 0);
+    // SAFETY: The descriptor is owned by device and this ioctl takes no pointer.
+    let fd = unsafe {
+        libc::ioctl(
+            device.as_raw_fd(),
+            request,
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: The ioctl returned a new, exclusively owned userfaultfd.
+    let uffd = unsafe { Uffd::from_raw_fd(fd) };
+    let mut api = uffdio_api {
+        api: UFFD_API,
+        features: if mode == PostcopyRegistrationMode::MinorShmem {
+            UFFD_FEATURE_MINOR_SHMEM
+        } else {
+            0
+        },
+        ioctls: 0,
+    };
+    // SAFETY: api is a valid, writable UFFDIO_API argument.
+    if unsafe { libc::ioctl(uffd.as_raw_fd(), UFFDIO_API as libc::c_ulong, &mut api) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(uffd)
 }
 
 #[cfg(feature = "postcopy")]
@@ -846,17 +885,25 @@ where
             uffd_builder.require_features(FeatureFlags::from_bits_retain(UFFD_FEATURE_MINOR_SHMEM));
         }
 
-        let uffd = uffd_builder
-            .close_on_exec(true)
-            .non_blocking(true)
-            .user_mode_only(true)
-            .create()
-            .map_err(|e| {
-                let error =
-                    postcopy_uffd_error(e, self.backend.postcopy_registration_mode(), "feature");
-                log::error!("failed to create postcopy userfaultfd: {error:?}");
-                VhostUserError::ReqHandlerError(error)
-            })?;
+        let uffd = if let Some(device) = &self.uffd_device {
+            create_device_uffd(device, self.backend.postcopy_registration_mode())
+                .map_err(VhostUserError::ReqHandlerError)?
+        } else {
+            uffd_builder
+                .close_on_exec(true)
+                .non_blocking(true)
+                .user_mode_only(false)
+                .create()
+                .map_err(|e| {
+                    let error = postcopy_uffd_error(
+                        e,
+                        self.backend.postcopy_registration_mode(),
+                        "feature",
+                    );
+                    log::error!("failed to create postcopy userfaultfd: {error:?}");
+                    VhostUserError::ReqHandlerError(error)
+                })?
+        };
 
         // We need to duplicate the uffd fd because we need both
         // to return File with fd and store fd inside uffd.
