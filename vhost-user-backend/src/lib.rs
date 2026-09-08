@@ -159,6 +159,12 @@ where
         self.conn_state = None;
     }
 
+    /// Retain access to `/dev/userfaultfd` across sandbox setup.
+    #[cfg(feature = "postcopy")]
+    pub fn set_postcopy_uffd_device(&mut self, device: std::fs::File) {
+        self.handler.lock().unwrap().uffd_device = Some(device);
+    }
+
     /// Run a dedicated thread handling all requests coming through the socket.
     /// This runs in an infinite loop that should be terminating once the other
     /// end of the socket (the VMM) hangs up or [`request_shutdown`](Self::request_shutdown)
