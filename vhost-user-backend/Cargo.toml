@@ -12,7 +12,11 @@ license = "Apache-2.0"
 all-features = true
 rustc-args = ["--cfg", "RUSTDOC_disable_feature_compat_errors"]
 
+[package.metadata.cargo-all-features]
+skip_feature_sets = [["xen", "postcopy"]]
+
 [features]
+default = ["postcopy"]
 xen = ["vm-memory/xen", "vhost/xen"]
 postcopy = ["vhost/postcopy", "userfaultfd"]
 
@@ -28,15 +32,10 @@ vmm-sys-util = { workspace = true }
 
 [dev-dependencies]
 nix = { version = "0.31", features = ["fs"] }
-uuid = { version = "1.8.0", features=["v4"] }
+tempfile = "3.2.0"
+uuid = { version = "1.8.0", features = ["v4"] }
 vhost = { path = "../vhost", version = "0.17.0", features = ["test-utils", "vhost-user-frontend", "vhost-user-backend"] }
 vm-memory = { workspace = true, features = ["backend-mmap", "backend-atomic"] }
-tempfile = "3.2.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(RUSTDOC_disable_feature_compat_errors)'] }
-
-[package.metadata.cargo-all-features]
-skip_feature_sets = [
-    ["xen", "postcopy"]
-]
