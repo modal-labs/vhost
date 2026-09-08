@@ -849,14 +849,13 @@ where
         let uffd = uffd_builder
             .close_on_exec(true)
             .non_blocking(true)
-            .user_mode_only(false)
+            .user_mode_only(true)
             .create()
             .map_err(|e| {
-                VhostUserError::ReqHandlerError(postcopy_uffd_error(
-                    e,
-                    self.backend.postcopy_registration_mode(),
-                    "feature",
-                ))
+                let error =
+                    postcopy_uffd_error(e, self.backend.postcopy_registration_mode(), "feature");
+                log::error!("failed to create postcopy userfaultfd: {error:?}");
+                VhostUserError::ReqHandlerError(error)
             })?;
 
         // We need to duplicate the uffd fd because we need both
