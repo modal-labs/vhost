@@ -44,10 +44,15 @@ pub trait VhostUserBackendReqHandler {
     fn reset_device(&self) -> Result<()>;
     fn get_features(&self) -> Result<u64>;
     fn set_features(&self, features: u64) -> Result<()>;
-    #[cfg(not(feature = "postcopy"))]
     fn set_mem_table(&self, ctx: &[VhostUserMemoryRegion], files: Vec<File>) -> Result<()>;
     #[cfg(feature = "postcopy")]
-    fn set_mem_table(&self, ctx: &[VhostUserMemoryRegion], files: Vec<File>) -> Result<Vec<u64>>;
+    fn set_mem_table_postcopy(
+        &self,
+        _ctx: &[VhostUserMemoryRegion],
+        _files: Vec<File>,
+    ) -> Result<Vec<u64>> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     fn set_vring_num(&self, index: u32, num: u32) -> Result<()>;
     fn set_vring_addr(
         &self,
@@ -76,10 +81,15 @@ pub trait VhostUserBackendReqHandler {
     fn get_inflight_fd(&self, inflight: &VhostUserInflight) -> Result<(VhostUserInflight, File)>;
     fn set_inflight_fd(&self, inflight: &VhostUserInflight, file: File) -> Result<()>;
     fn get_max_mem_slots(&self) -> Result<u64>;
-    #[cfg(not(feature = "postcopy"))]
     fn add_mem_region(&self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<()>;
     #[cfg(feature = "postcopy")]
-    fn add_mem_region(&self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<u64>;
+    fn add_mem_region_postcopy(
+        &self,
+        _region: &VhostUserSingleMemoryRegion,
+        _fd: File,
+    ) -> Result<u64> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     fn remove_mem_region(&self, region: &VhostUserSingleMemoryRegion) -> Result<()>;
     fn set_device_state_fd(
         &self,
@@ -90,13 +100,21 @@ pub trait VhostUserBackendReqHandler {
     fn check_device_state(&self) -> Result<()>;
     fn get_shmem_config(&self) -> Result<VhostUserShMemConfig>;
     #[cfg(feature = "postcopy")]
-    fn postcopy_advice(&self) -> Result<File>;
+    fn postcopy_advice(&self) -> Result<File> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_listen(&self) -> Result<()>;
+    fn postcopy_listen(&self) -> Result<()> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_memory_ack(&self) -> Result<()>;
+    fn postcopy_memory_ack(&self) -> Result<()> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_end(&self) -> Result<()>;
+    fn postcopy_end(&self) -> Result<()> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     fn set_log_base(&self, log: &VhostUserLog, file: File) -> Result<()>;
 }
 
@@ -110,14 +128,15 @@ pub trait VhostUserBackendReqHandlerMut {
     fn reset_device(&mut self) -> Result<()>;
     fn get_features(&mut self) -> Result<u64>;
     fn set_features(&mut self, features: u64) -> Result<()>;
-    #[cfg(not(feature = "postcopy"))]
     fn set_mem_table(&mut self, ctx: &[VhostUserMemoryRegion], files: Vec<File>) -> Result<()>;
     #[cfg(feature = "postcopy")]
-    fn set_mem_table(
+    fn set_mem_table_postcopy(
         &mut self,
-        ctx: &[VhostUserMemoryRegion],
-        files: Vec<File>,
-    ) -> Result<Vec<u64>>;
+        _ctx: &[VhostUserMemoryRegion],
+        _files: Vec<File>,
+    ) -> Result<Vec<u64>> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     fn set_vring_num(&mut self, index: u32, num: u32) -> Result<()>;
     fn set_vring_addr(
         &mut self,
@@ -154,10 +173,15 @@ pub trait VhostUserBackendReqHandlerMut {
     ) -> Result<(VhostUserInflight, File)>;
     fn set_inflight_fd(&mut self, inflight: &VhostUserInflight, file: File) -> Result<()>;
     fn get_max_mem_slots(&mut self) -> Result<u64>;
-    #[cfg(not(feature = "postcopy"))]
     fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<()>;
     #[cfg(feature = "postcopy")]
-    fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<u64>;
+    fn add_mem_region_postcopy(
+        &mut self,
+        _region: &VhostUserSingleMemoryRegion,
+        _fd: File,
+    ) -> Result<u64> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     fn remove_mem_region(&mut self, region: &VhostUserSingleMemoryRegion) -> Result<()>;
     fn set_device_state_fd(
         &mut self,
@@ -168,13 +192,21 @@ pub trait VhostUserBackendReqHandlerMut {
     fn check_device_state(&mut self) -> Result<()>;
     fn get_shmem_config(&mut self) -> Result<VhostUserShMemConfig>;
     #[cfg(feature = "postcopy")]
-    fn postcopy_advice(&mut self) -> Result<File>;
+    fn postcopy_advice(&mut self) -> Result<File> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_listen(&mut self) -> Result<()>;
+    fn postcopy_listen(&mut self) -> Result<()> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_memory_ack(&mut self) -> Result<()>;
+    fn postcopy_memory_ack(&mut self) -> Result<()> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     #[cfg(feature = "postcopy")]
-    fn postcopy_end(&mut self) -> Result<()>;
+    fn postcopy_end(&mut self) -> Result<()> {
+        Err(Error::InvalidOperation("postcopy is unsupported"))
+    }
     fn set_log_base(&mut self, log: &VhostUserLog, file: File) -> Result<()>;
 }
 
@@ -199,14 +231,17 @@ impl<T: VhostUserBackendReqHandlerMut> VhostUserBackendReqHandler for Mutex<T> {
         self.lock().unwrap().set_features(features)
     }
 
-    #[cfg(not(feature = "postcopy"))]
     fn set_mem_table(&self, ctx: &[VhostUserMemoryRegion], files: Vec<File>) -> Result<()> {
         self.lock().unwrap().set_mem_table(ctx, files)
     }
 
     #[cfg(feature = "postcopy")]
-    fn set_mem_table(&self, ctx: &[VhostUserMemoryRegion], files: Vec<File>) -> Result<Vec<u64>> {
-        self.lock().unwrap().set_mem_table(ctx, files)
+    fn set_mem_table_postcopy(
+        &self,
+        ctx: &[VhostUserMemoryRegion],
+        files: Vec<File>,
+    ) -> Result<Vec<u64>> {
+        self.lock().unwrap().set_mem_table_postcopy(ctx, files)
     }
 
     fn set_vring_num(&self, index: u32, num: u32) -> Result<()> {
@@ -295,14 +330,17 @@ impl<T: VhostUserBackendReqHandlerMut> VhostUserBackendReqHandler for Mutex<T> {
         self.lock().unwrap().get_max_mem_slots()
     }
 
-    #[cfg(not(feature = "postcopy"))]
     fn add_mem_region(&self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<()> {
         self.lock().unwrap().add_mem_region(region, fd)
     }
 
     #[cfg(feature = "postcopy")]
-    fn add_mem_region(&self, region: &VhostUserSingleMemoryRegion, fd: File) -> Result<u64> {
-        self.lock().unwrap().add_mem_region(region, fd)
+    fn add_mem_region_postcopy(
+        &self,
+        region: &VhostUserSingleMemoryRegion,
+        fd: File,
+    ) -> Result<u64> {
+        self.lock().unwrap().add_mem_region_postcopy(region, fd)
     }
 
     fn remove_mem_region(&self, region: &VhostUserSingleMemoryRegion) -> Result<()> {
@@ -554,14 +592,15 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                     {
                         return Err(Error::InvalidOperation("invalid postcopy state"));
                     }
-                    let res = self.set_mem_table(&hdr, size, &buf, files);
                     if special {
+                        let res = self.set_mem_table_postcopy(&hdr, size, &buf, files);
                         let bases = res?;
                         self.send_postcopy_mem_table_reply(&hdr, &buf, &bases)?;
                         self.postcopy_state =
                             PostcopyState::AwaitingAck(FrontendReq::SET_MEM_TABLE);
                     } else {
-                        self.send_ack_message(&hdr, res.map(|_| ()))?;
+                        let res = self.set_mem_table(&hdr, size, &buf, files);
+                        self.send_ack_message(&hdr, res)?;
                     }
                 }
             }
@@ -750,8 +789,10 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                     {
                         return Err(Error::InvalidOperation("invalid postcopy state"));
                     }
-                    let res = self.backend.add_mem_region(&msg, files.swap_remove(0));
                     if special {
+                        let res = self
+                            .backend
+                            .add_mem_region_postcopy(&msg, files.swap_remove(0));
                         let base = res?;
                         let reply = VhostUserSingleMemoryRegion::new(
                             msg.guest_phys_addr,
@@ -762,7 +803,8 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                         self.send_reply_message(&hdr, &reply)?;
                         self.postcopy_state = PostcopyState::AwaitingAck(FrontendReq::ADD_MEM_REG);
                     } else {
-                        self.send_ack_message(&hdr, res.map(|_| ()))?;
+                        let res = self.backend.add_mem_region(&msg, files.swap_remove(0));
+                        self.send_ack_message(&hdr, res)?;
                     }
                 }
             }
@@ -893,7 +935,6 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         Ok(())
     }
 
-    #[cfg(not(feature = "postcopy"))]
     fn set_mem_table(
         &mut self,
         hdr: &VhostUserMsgHeader<FrontendReq>,
@@ -944,7 +985,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
     }
 
     #[cfg(feature = "postcopy")]
-    fn set_mem_table(
+    fn set_mem_table_postcopy(
         &mut self,
         hdr: &VhostUserMsgHeader<FrontendReq>,
         size: usize,
@@ -975,7 +1016,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         if regions.iter().any(|region| !region.is_valid()) {
             return Err(Error::InvalidMessage);
         }
-        let bases = self.backend.set_mem_table(regions, files)?;
+        let bases = self.backend.set_mem_table_postcopy(regions, files)?;
         if bases.len() != regions.len() {
             return Err(Error::InvalidMessage);
         }

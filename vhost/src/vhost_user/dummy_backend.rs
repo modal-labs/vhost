@@ -118,13 +118,12 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(())
     }
 
-    #[cfg(not(feature = "postcopy"))]
     fn set_mem_table(&mut self, _ctx: &[VhostUserMemoryRegion], _files: Vec<File>) -> Result<()> {
         Ok(())
     }
 
     #[cfg(feature = "postcopy")]
-    fn set_mem_table(
+    fn set_mem_table_postcopy(
         &mut self,
         ctx: &[VhostUserMemoryRegion],
         _files: Vec<File>,
@@ -319,13 +318,16 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(MAX_MEM_SLOTS as u64)
     }
 
-    #[cfg(not(feature = "postcopy"))]
     fn add_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion, _fd: File) -> Result<()> {
         Ok(())
     }
 
     #[cfg(feature = "postcopy")]
-    fn add_mem_region(&mut self, region: &VhostUserSingleMemoryRegion, _fd: File) -> Result<u64> {
+    fn add_mem_region_postcopy(
+        &mut self,
+        region: &VhostUserSingleMemoryRegion,
+        _fd: File,
+    ) -> Result<u64> {
         Ok(region.user_addr)
     }
 

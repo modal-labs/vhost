@@ -92,15 +92,6 @@ struct AddrMapping {
     gpa_base: u64,
 }
 
-#[cfg(feature = "postcopy")]
-type SetMemoryResult = Vec<u64>;
-#[cfg(not(feature = "postcopy"))]
-type SetMemoryResult = ();
-#[cfg(feature = "postcopy")]
-type AddMemoryResult = u64;
-#[cfg(not(feature = "postcopy"))]
-type AddMemoryResult = ();
-
 pub struct VhostUserHandler<T: VhostUserBackend> {
     backend: T,
     handlers: Vec<Arc<VringEpollHandler<T>>>,
@@ -468,7 +459,7 @@ where
         &mut self,
         ctx: &[VhostUserMemoryRegion],
         files: Vec<File>,
-    ) -> VhostUserResult<SetMemoryResult> {
+    ) -> VhostUserResult<()> {
         // We need to create tuple of ranges from the list of VhostUserMemoryRegion
         // that we get from the caller.
         let mut regions = Vec::new();
@@ -495,17 +486,6 @@ where
         let mem = GuestMemoryMmap::from_regions(regions)
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
 
-        #[cfg(feature = "postcopy")]
-        if self.postcopy_listening {
-            for mapping in &mappings {
-                self.register_postcopy_mapping(mapping)?;
-            }
-            let bases = mappings.iter().map(|mapping| mapping.local_addr).collect();
-            self.pending_mem = Some(mem);
-            self.pending_mappings = mappings;
-            return Ok(bases);
-        }
-
         // Updating the inner GuestMemory object here will cause all our vrings to
         // see the new one the next time they call to `atomic_mem.memory()`.
         self.atomic_mem.lock().unwrap().replace(mem);
@@ -515,14 +495,44 @@ where
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
         self.mappings = mappings;
 
-        #[cfg(feature = "postcopy")]
-        return Ok(self
-            .mappings
-            .iter()
-            .map(|mapping| mapping.local_addr)
-            .collect());
-        #[cfg(not(feature = "postcopy"))]
         Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn set_mem_table_postcopy(
+        &mut self,
+        ctx: &[VhostUserMemoryRegion],
+        files: Vec<File>,
+    ) -> VhostUserResult<Vec<u64>> {
+        let mut regions = Vec::new();
+        let mut mappings = Vec::new();
+
+        for (region, file) in ctx.iter().zip(files) {
+            let guest_region = GuestRegionMmap::new(
+                region.mmap_region(file)?,
+                GuestAddress(region.guest_phys_addr),
+            )
+            .ok_or(VhostUserError::ReqHandlerError(
+                io::ErrorKind::InvalidInput.into(),
+            ))?;
+            mappings.push(AddrMapping {
+                local_addr: guest_region.as_ptr() as u64,
+                vmm_addr: region.user_addr,
+                size: region.memory_size,
+                gpa_base: region.guest_phys_addr,
+            });
+            regions.push(guest_region);
+        }
+
+        let mem = GuestMemoryMmap::from_regions(regions)
+            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+        for mapping in &mappings {
+            self.register_postcopy_mapping(mapping)?;
+        }
+        let bases = mappings.iter().map(|mapping| mapping.local_addr).collect();
+        self.pending_mem = Some(mem);
+        self.pending_mappings = mappings;
+        Ok(bases)
     }
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> VhostUserResult<()> {
@@ -777,7 +787,7 @@ where
         &mut self,
         region: &VhostUserSingleMemoryRegion,
         file: File,
-    ) -> VhostUserResult<AddMemoryResult> {
+    ) -> VhostUserResult<()> {
         let guest_region = Arc::new(
             GuestRegionMmap::new(
                 region.mmap_region(file)?,
@@ -796,29 +806,10 @@ where
             gpa_base: region.guest_phys_addr,
         };
 
-        #[cfg(feature = "postcopy")]
-        let current_mem = self
-            .pending_mem
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| (*self.atomic_mem.memory()).clone());
-        #[cfg(not(feature = "postcopy"))]
         let current_mem = self.atomic_mem.memory();
         let mem = current_mem
             .insert_region(guest_region)
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
-
-        #[cfg(feature = "postcopy")]
-        if self.postcopy_listening {
-            self.register_postcopy_mapping(&addr_mapping)?;
-            let local_addr = addr_mapping.local_addr;
-            if self.pending_mem.is_none() {
-                self.pending_mappings = self.mappings.clone();
-            }
-            self.pending_mem = Some(mem);
-            self.pending_mappings.push(addr_mapping);
-            return Ok(local_addr);
-        }
 
         self.atomic_mem.lock().unwrap().replace(mem);
 
@@ -828,10 +819,47 @@ where
 
         self.mappings.push(addr_mapping);
 
-        #[cfg(feature = "postcopy")]
-        return Ok(self.mappings.last().unwrap().local_addr);
-        #[cfg(not(feature = "postcopy"))]
         Ok(())
+    }
+
+    #[cfg(feature = "postcopy")]
+    fn add_mem_region_postcopy(
+        &mut self,
+        region: &VhostUserSingleMemoryRegion,
+        file: File,
+    ) -> VhostUserResult<u64> {
+        let guest_region = Arc::new(
+            GuestRegionMmap::new(
+                region.mmap_region(file)?,
+                GuestAddress(region.guest_phys_addr),
+            )
+            .ok_or(VhostUserError::ReqHandlerError(
+                io::ErrorKind::InvalidInput.into(),
+            ))?,
+        );
+        let addr_mapping = AddrMapping {
+            local_addr: guest_region.as_ptr() as u64,
+            vmm_addr: region.user_addr,
+            size: region.memory_size,
+            gpa_base: region.guest_phys_addr,
+        };
+        let current_mem = self
+            .pending_mem
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| (*self.atomic_mem.memory()).clone());
+        let mem = current_mem
+            .insert_region(guest_region)
+            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+
+        self.register_postcopy_mapping(&addr_mapping)?;
+        let local_addr = addr_mapping.local_addr;
+        if self.pending_mem.is_none() {
+            self.pending_mappings = self.mappings.clone();
+        }
+        self.pending_mem = Some(mem);
+        self.pending_mappings.push(addr_mapping);
+        Ok(local_addr)
     }
 
     fn remove_mem_region(&mut self, region: &VhostUserSingleMemoryRegion) -> VhostUserResult<()> {
