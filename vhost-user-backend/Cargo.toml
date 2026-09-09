@@ -16,7 +16,7 @@ rustc-args = ["--cfg", "RUSTDOC_disable_feature_compat_errors"]
 skip_feature_sets = [["xen", "postcopy"]]
 
 [features]
-default = ["postcopy"]
+default = []
 xen = ["vm-memory/xen", "vhost/xen"]
 postcopy = ["vhost/postcopy", "userfaultfd", "userfaultfd-sys"]
 
