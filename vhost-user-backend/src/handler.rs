@@ -238,6 +238,19 @@ where
             "no registered UFFD handler",
         ))?;
         let mode = self.backend.postcopy_registration_mode();
+        if mode == PostcopyRegistrationMode::MinorShmem {
+            // SAFETY: the handler holds the GuestRegionMmap for this address range.
+            let result = unsafe {
+                libc::madvise(
+                    mapping.local_addr as *mut libc::c_void,
+                    mapping.size as usize,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            };
+            if result != 0 {
+                return Err(VhostUserError::ReqHandlerError(io::Error::last_os_error()));
+            }
+        }
         let register_mode = match mode {
             PostcopyRegistrationMode::Missing => RegisterMode::MISSING,
             PostcopyRegistrationMode::MinorShmem => RegisterMode::MISSING | RegisterMode::MINOR,
