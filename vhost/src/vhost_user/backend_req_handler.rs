@@ -1240,6 +1240,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                 | FrontendReq::SET_DEVICE_STATE_FD
                 | FrontendReq::GPU_SET_SOCKET,
             ) => Ok(()),
+            Ok(FrontendReq::REM_MEM_REG) if files.as_ref().is_none_or(|f| f.len() == 1) => Ok(()),
             _ if files.is_some() => Err(Error::InvalidMessage),
             _ => Ok(()),
         }
@@ -1422,6 +1423,24 @@ mod tests {
         handler.set_failed(libc::EAGAIN);
         handler.check_state().unwrap_err();
         assert!(handler.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn test_rem_mem_reg_accepts_one_fd() {
+        let (p1, _p2) = UnixStream::pair().unwrap();
+        let endpoint = Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(p1);
+        let backend = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let handler = BackendReqHandler::new(endpoint, backend);
+        let hdr = VhostUserMsgHeader::new(FrontendReq::REM_MEM_REG, 0, 0);
+        let file = || File::open("/dev/null").unwrap();
+
+        handler.check_attached_files(&hdr, &None).unwrap();
+        handler
+            .check_attached_files(&hdr, &Some(vec![file()]))
+            .unwrap();
+        handler
+            .check_attached_files(&hdr, &Some(vec![file(), file()]))
+            .unwrap_err();
     }
 
     // Helper to send GET_SHMEM_CONFIG request and receive response

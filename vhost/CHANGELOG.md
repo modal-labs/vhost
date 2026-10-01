@@ -6,6 +6,7 @@
 ### Changed
 ### Deprecated
 ### Fixed
+- Accept one file descriptor on `VHOST_USER_REM_MEM_REG`, as the spec allows.
 
 ## v0.17.0
 
