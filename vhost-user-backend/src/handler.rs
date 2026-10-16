@@ -331,7 +331,24 @@ where
 
 #[cfg(feature = "postcopy")]
 fn create_device_uffd(device: &File, mode: PostcopyRegistrationMode) -> io::Result<Uffd> {
-    use userfaultfd_sys::{uffdio_api, UFFDIO_API, UFFD_API, UFFD_FEATURE_MINOR_SHMEM};
+    let base = if mode == PostcopyRegistrationMode::MinorShmem {
+        userfaultfd_sys::UFFD_FEATURE_MINOR_SHMEM
+    } else {
+        0
+    };
+    // The front-end may write-protect the memory to track the pages this
+    // backend writes; the kernel only allows that if the feature is set here.
+    create_device_uffd_with(device, base | UFFD_FEATURES_WP_ASYNC)
+        .or_else(|_| create_device_uffd_with(device, base))
+}
+
+/// Lets a front-end track this backend's writes with async write protection.
+#[cfg(feature = "postcopy")]
+const UFFD_FEATURES_WP_ASYNC: u64 = (1 << 12) | (1 << 15);
+
+#[cfg(feature = "postcopy")]
+fn create_device_uffd_with(device: &File, features: u64) -> io::Result<Uffd> {
+    use userfaultfd_sys::{uffdio_api, UFFDIO_API, UFFD_API};
 
     // USERFAULTFD_IOC_NEW takes creation flags as an integer, not a pointer.
     let request = libc::_IO(userfaultfd_sys::USERFAULTFD_IOC, 0);
@@ -350,11 +367,7 @@ fn create_device_uffd(device: &File, mode: PostcopyRegistrationMode) -> io::Resu
     let uffd = unsafe { Uffd::from_raw_fd(fd) };
     let mut api = uffdio_api {
         api: UFFD_API,
-        features: if mode == PostcopyRegistrationMode::MinorShmem {
-            UFFD_FEATURE_MINOR_SHMEM
-        } else {
-            0
-        },
+        features,
         ioctls: 0,
     };
     // SAFETY: api is a valid, writable UFFDIO_API argument.
@@ -919,22 +932,27 @@ where
 
     #[cfg(feature = "postcopy")]
     fn postcopy_advice(&mut self) -> VhostUserResult<File> {
-        let mut uffd_builder = UffdBuilder::new();
-
+        let mut base = 0;
         if self.backend.postcopy_registration_mode() == PostcopyRegistrationMode::MinorShmem {
             const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
-            uffd_builder.require_features(FeatureFlags::from_bits_retain(UFFD_FEATURE_MINOR_SHMEM));
+            base |= UFFD_FEATURE_MINOR_SHMEM;
         }
-
-        let uffd = if let Some(device) = &self.uffd_device {
-            create_device_uffd(device, self.backend.postcopy_registration_mode())
-                .map_err(VhostUserError::ReqHandlerError)?
-        } else {
+        let builder = |features: u64| {
+            let mut uffd_builder = UffdBuilder::new();
+            uffd_builder.require_features(FeatureFlags::from_bits_retain(features));
             uffd_builder
                 .close_on_exec(true)
                 .non_blocking(true)
                 .user_mode_only(false)
                 .create()
+        };
+
+        let uffd = if let Some(device) = &self.uffd_device {
+            create_device_uffd(device, self.backend.postcopy_registration_mode())
+                .map_err(VhostUserError::ReqHandlerError)?
+        } else {
+            builder(base | UFFD_FEATURES_WP_ASYNC)
+                .or_else(|_| builder(base))
                 .map_err(|e| {
                     let error = postcopy_uffd_error(
                         e,
