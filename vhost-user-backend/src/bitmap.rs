@@ -23,6 +23,9 @@ pub trait BitmapReplace: Bitmap {
 
     /// Replace the internal `Bitmap`
     fn replace(&self, bitmap: Self::InnerBitmap);
+
+    /// Drop the internal `Bitmap`, so writes are no longer logged
+    fn clear(&self);
 }
 
 /// A bitmap relative to a memory region
@@ -42,6 +45,8 @@ impl BitmapReplace for () {
     fn replace(&self, _bitmap: ()) {
         panic!("The unit bitmap () must not be used if VHOST_USER_PROTOCOL_F_LOG_SHMFD is set");
     }
+
+    fn clear(&self) {}
 }
 
 impl MemRegionBitmap for () {
@@ -101,6 +106,10 @@ impl BitmapReplace for BitmapMmapRegion {
     fn replace(&self, bitmap: AtomicBitmapMmap) {
         let mut inner = self.inner.write().unwrap();
         inner.replace(bitmap);
+    }
+
+    fn clear(&self) {
+        self.inner.write().unwrap().take();
     }
 }
 

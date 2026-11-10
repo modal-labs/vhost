@@ -236,6 +236,21 @@ where
     T: VhostUserBackend,
     T::Bitmap: BitmapReplace,
 {
+    /// Stops marking pages in the dirty log and releases its mapping.
+    fn stop_logging(&mut self) {
+        if self.log_mem.take().is_none() {
+            return;
+        }
+        #[cfg(feature = "postcopy")]
+        let pending = self.pending_mem.as_ref();
+        #[cfg(not(feature = "postcopy"))]
+        let pending: Option<&GuestMemoryMmap<T::Bitmap>> = None;
+        let mem = self.atomic_mem.memory();
+        for region in mem.iter().chain(pending.into_iter().flat_map(|m| m.iter())) {
+            region.bitmap().clear();
+        }
+    }
+
     /// Points a new region's bitmap at the active dirty log, if any.
     fn attach_log(&self, region: &GuestRegionMmap<T::Bitmap>) -> VhostUserResult<()> {
         if let Some(logmem) = &self.log_mem {
@@ -456,6 +471,10 @@ where
 
         self.acked_features = features;
         self.features_acked = true;
+
+        if features & VhostUserVirtioFeatures::LOG_ALL.bits() == 0 {
+            self.stop_logging();
+        }
 
         // Upon receiving a `VHOST_USER_SET_FEATURES` message from the front-end without
         // `VHOST_USER_F_PROTOCOL_FEATURES` set, the back-end must enable all rings immediately.
@@ -1033,9 +1052,7 @@ where
     // the size and offset of shared memory area are provided in the `VhostUserLog` message.
     //
     // See https://qemu-project.gitlab.io/qemu/interop/vhost-user.html#migration.
-    // TODO: We ignore the `LOG_ALL` flag on `SET_FEATURES`, so we will continue marking pages as
-    // dirty even if the migration fails. We need to disable the logging after receiving  a
-    // `SET_FEATURE` without the `LOG_ALL` flag.
+    // Logging stops on a `SET_FEATURES` without `LOG_ALL`.
     fn set_log_base(&mut self, log: &VhostUserLog, file: File) -> VhostUserResult<()> {
         let mem = self.atomic_mem.memory();
 
