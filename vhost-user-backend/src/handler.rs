@@ -118,6 +118,8 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     worker_threads: Vec<thread::JoinHandle<VringEpollResult<()>>>,
     #[cfg(feature = "postcopy")]
     event_gate: Arc<EventGate>,
+    /// Dirty log installed by `SET_LOG_BASE`, applied to regions added later.
+    log_mem: Option<Arc<MmapLogReg>>,
 }
 
 // Ensure VhostUserHandler: Clone + Send + Sync + 'static.
@@ -195,6 +197,7 @@ where
             worker_threads,
             #[cfg(feature = "postcopy")]
             event_gate,
+            log_mem: None,
         })
     }
 }
@@ -231,7 +234,18 @@ impl<T: VhostUserBackend> VhostUserHandler<T> {
 impl<T> VhostUserHandler<T>
 where
     T: VhostUserBackend,
+    T::Bitmap: BitmapReplace,
 {
+    /// Points a new region's bitmap at the active dirty log, if any.
+    fn attach_log(&self, region: &GuestRegionMmap<T::Bitmap>) -> VhostUserResult<()> {
+        if let Some(logmem) = &self.log_mem {
+            let bitmap = <T::Bitmap as BitmapReplace>::InnerBitmap::new(region, logmem.clone())
+                .map_err(VhostUserError::ReqHandlerError)?;
+            region.bitmap().replace(bitmap);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "postcopy")]
     fn register_postcopy_mapping(&self, mapping: &AddrMapping) -> VhostUserResult<()> {
         let uffd = self.uffd.as_ref().ok_or(VhostUserError::InvalidOperation(
@@ -486,6 +500,7 @@ where
             .ok_or(VhostUserError::ReqHandlerError(
                 io::ErrorKind::InvalidInput.into(),
             ))?;
+            self.attach_log(&guest_region)?;
             mappings.push(AddrMapping {
                 #[cfg(feature = "postcopy")]
                 local_addr: guest_region.as_ptr() as u64,
@@ -528,6 +543,7 @@ where
             .ok_or(VhostUserError::ReqHandlerError(
                 io::ErrorKind::InvalidInput.into(),
             ))?;
+            self.attach_log(&guest_region)?;
             mappings.push(AddrMapping {
                 local_addr: guest_region.as_ptr() as u64,
                 vmm_addr: region.user_addr,
@@ -811,6 +827,8 @@ where
             ))?,
         );
 
+        self.attach_log(&guest_region)?;
+
         let addr_mapping = AddrMapping {
             #[cfg(feature = "postcopy")]
             local_addr: guest_region.as_ptr() as u64,
@@ -850,6 +868,7 @@ where
                 io::ErrorKind::InvalidInput.into(),
             ))?,
         );
+        self.attach_log(&guest_region)?;
         let addr_mapping = AddrMapping {
             local_addr: guest_region.as_ptr() as u64,
             vmm_addr: region.user_addr,
@@ -1025,9 +1044,16 @@ where
                 .map_err(VhostUserError::ReqHandlerError)?,
         );
 
+        // Memory staged by postcopy becomes live on its ack, so it is logged too.
+        #[cfg(feature = "postcopy")]
+        let pending = self.pending_mem.as_ref();
+        #[cfg(not(feature = "postcopy"))]
+        let pending: Option<&GuestMemoryMmap<T::Bitmap>> = None;
+        let regions = mem.iter().chain(pending.into_iter().flat_map(|m| m.iter()));
+
         // Let's create all bitmaps first before replacing them, in case any of them fails
         let mut bitmaps = Vec::new();
-        for region in mem.iter() {
+        for region in regions {
             let bitmap = <<T as VhostUserBackend>::Bitmap as BitmapReplace>::InnerBitmap::new(
                 region,
                 Arc::clone(&logmem),
@@ -1040,6 +1066,7 @@ where
         for (region, bitmap) in bitmaps {
             (*region).bitmap().replace(bitmap);
         }
+        self.log_mem = Some(logmem);
 
         Ok(())
     }
