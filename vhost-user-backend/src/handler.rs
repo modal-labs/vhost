@@ -420,6 +420,7 @@ where
         for (index, vring) in self.vrings.iter().enumerate() {
             vring.set_enabled(false);
             self.update_vring_registration(vring, index as u8)?;
+            self.backend.stop_queue(index);
         }
 
         // Reset device state, retain protocol state
@@ -638,6 +639,7 @@ where
         // VHOST_USER_GET_VRING_BASE.
         vring.set_queue_ready(false);
         self.update_vring_registration(vring, index as u8)?;
+        self.backend.stop_queue(index as usize);
 
         let next_avail = vring.queue_next_avail();
 
@@ -724,6 +726,9 @@ where
         // with parameter 0.
         vring.set_enabled(enable);
         self.update_vring_registration(vring, index as u8)?;
+        if !enable {
+            self.backend.stop_queue(index as usize);
+        }
 
         Ok(())
     }
@@ -1117,5 +1122,29 @@ mod tests {
 
         let events = backend.lock().unwrap().events();
         assert_eq!(events, 1, "Backend SHOULD have been kicked after enabling");
+    }
+
+    #[test]
+    fn test_stop_queue_called_on_stop_disable_and_reset() {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
+        );
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut handler = VhostUserHandler::new(backend.clone(), mem).unwrap();
+        handler
+            .set_features(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits())
+            .unwrap();
+
+        handler.set_vring_enable(0, true).unwrap();
+        assert!(backend.lock().unwrap().stopped_queues().is_empty());
+
+        handler.set_vring_enable(0, false).unwrap();
+        assert_eq!(backend.lock().unwrap().stopped_queues(), &[0]);
+
+        handler.get_vring_base(1).unwrap();
+        assert_eq!(backend.lock().unwrap().stopped_queues(), &[0, 1]);
+
+        handler.reset_device().unwrap();
+        assert_eq!(backend.lock().unwrap().stopped_queues(), &[0, 1, 0, 1]);
     }
 }

@@ -82,6 +82,8 @@ pub trait VhostUserBackend: Send + Sync {
     /// function.
     fn reset_device(&self) {}
 
+    fn stop_queue(&self, _queue_index: usize) {}
+
     /// Enable or disable the virtio EVENT_IDX feature
     fn set_event_idx(&self, enabled: bool);
 
@@ -237,6 +239,8 @@ pub trait VhostUserBackendMut: Send + Sync {
     /// A default implementation is provided as we cannot expect all backends to implement this
     /// function.
     fn reset_device(&mut self) {}
+
+    fn stop_queue(&mut self, _queue_index: usize) {}
 
     /// Enable or disable the virtio EVENT_IDX feature
     fn set_event_idx(&mut self, enabled: bool);
@@ -394,6 +398,10 @@ impl<T: VhostUserBackend> VhostUserBackend for Arc<T> {
         self.deref().reset_device()
     }
 
+    fn stop_queue(&self, queue_index: usize) {
+        self.deref().stop_queue(queue_index)
+    }
+
     fn set_event_idx(&self, enabled: bool) {
         self.deref().set_event_idx(enabled)
     }
@@ -490,6 +498,10 @@ impl<T: VhostUserBackendMut> VhostUserBackend for Mutex<T> {
 
     fn reset_device(&self) {
         self.lock().unwrap().reset_device()
+    }
+
+    fn stop_queue(&self, queue_index: usize) {
+        self.lock().unwrap().stop_queue(queue_index)
     }
 
     fn set_event_idx(&self, enabled: bool) {
@@ -593,6 +605,10 @@ impl<T: VhostUserBackendMut> VhostUserBackend for RwLock<T> {
         self.write().unwrap().reset_device()
     }
 
+    fn stop_queue(&self, queue_index: usize) {
+        self.write().unwrap().stop_queue(queue_index)
+    }
+
     fn set_event_idx(&self, enabled: bool) {
         self.write().unwrap().set_event_idx(enabled)
     }
@@ -674,6 +690,7 @@ pub mod tests {
         events: u64,
         event_idx: bool,
         acked_features: u64,
+        stopped_queues: Vec<usize>,
         exit_event_fds: Vec<(EventConsumer, EventNotifier)>,
     }
 
@@ -683,6 +700,7 @@ pub mod tests {
                 events: 0,
                 event_idx: false,
                 acked_features: 0,
+                stopped_queues: vec![],
                 exit_event_fds: vec![],
             };
 
@@ -701,6 +719,10 @@ pub mod tests {
 
         pub fn events(&self) -> u64 {
             self.events
+        }
+
+        pub fn stopped_queues(&self) -> &[usize] {
+            &self.stopped_queues
         }
     }
 
@@ -732,6 +754,10 @@ pub mod tests {
             self.event_idx = false;
             self.events = 0;
             self.acked_features = 0;
+        }
+
+        fn stop_queue(&mut self, queue_index: usize) {
+            self.stopped_queues.push(queue_index);
         }
 
         fn set_event_idx(&mut self, enabled: bool) {
